@@ -87,12 +87,49 @@ namespace CarCombat
 
             var shooter = CarSim.Spawn(0);
             var victim = CarSim.Spawn(1);
-            if (!CarSim.TryHit(shooter, victim, out int block))
+            int block = -1;
+            bool hit = false;
+            for (int pitch = 0; pitch <= (int)CarSim.PitchMax && !hit; pitch += 5)
+            {
+                var aimed = shooter;
+                aimed.pitch = pitch;
+                hit = CarSim.TryHit(aimed, victim, out block);
+            }
+
+            if (!hit)
                 throw new InvalidOperationException("Выстрел в машину напротив не попал.");
             int before = CarSim.TotalHp(victim.blocks);
             victim.blocks = CarSim.Damage(victim.blocks, block);
             if (CarSim.TotalHp(victim.blocks) >= before)
                 throw new InvalidOperationException("Попадание не сняло блок.");
+
+            var plate = CarSim.Spawn(1);
+            int plateHp = plate.blocks.Get(block);
+            var punched = CarSim.ApplyShell(plate.blocks, plate, CarSim.BlockWorld(plate, block), 0, block);
+            if (punched.Get(block) != Mathf.Max(0, plateHp - Solid.Of(0).directDamage))
+                throw new InvalidOperationException("Бронебойный не снял большой урон с одного блока.");
+            int neighbor = -1;
+            int far = -1;
+            var impact = CarSim.BlockWorld(plate, block);
+            float splashReach = Solid.Of(1).splashRadius;
+            for (int i = 0; i < CarSim.BlockCount; i++)
+            {
+                if (i == block || plate.blocks.Get(i) <= 0)
+                    continue;
+                float away = Vector3.Distance(CarSim.BlockWorld(plate, i), impact);
+                if (neighbor < 0 && away <= splashReach)
+                    neighbor = i;
+                if (away > splashReach + CarSim.Cell)
+                    far = i;
+            }
+
+            var blast = CarSim.ApplyShell(plate.blocks, plate, impact, 1, block);
+            if (blast.Get(block) != Mathf.Max(0, plateHp - Solid.Of(1).directDamage))
+                throw new InvalidOperationException("Фугас не повредил блок попадания.");
+            if (neighbor >= 0 && blast.Get(neighbor) >= plate.blocks.Get(neighbor))
+                throw new InvalidOperationException("Фугас не задел соседний воксель.");
+            if (far >= 0 && blast.Get(far) != plate.blocks.Get(far))
+                throw new InvalidOperationException("Фугас задел слишком далёкий воксель.");
 
             var missed = shooter;
             missed.yaw = 90f;
@@ -118,6 +155,91 @@ namespace CarCombat
             var inputHasNoPosition = new DriveInput { tick = 4, throttle = 1, steer = -1, fire = true };
             if (inputHasNoPosition.tick != 4)
                 throw new InvalidOperationException("Команда сломалась.");
+
+            var aim = CarSim.Spawn(0);
+            var pivot = CarSim.TurretWorld(aim);
+            int world = CarSim.WorldYawDegrees(pivot, pivot + new Vector3(4f, 0f, 0f), 0);
+            if (Mathf.Abs(Mathf.DeltaAngle(world, 90f)) > 2f)
+                throw new InvalidOperationException("Курсор справа не дал курс 90°. " + world);
+            for (int i = 0; i < 20; i++)
+                aim = CarSim.Apply(aim, new DriveInput { tick = i + 1, turret = world }, true);
+            if (Mathf.Abs(aim.yaw) > 0.01f || Mathf.Abs(Mathf.DeltaAngle(aim.turret, 90f)) > 2f)
+                throw new InvalidOperationException("Башня не довернулась к курсору справа: " + aim.turret);
+
+            for (int i = 0; i < 25; i++)
+            {
+                aim = CarSim.Apply(aim, new DriveInput
+                {
+                    tick = 21 + i,
+                    throttle = 1,
+                    steer = 1,
+                    turret = world
+                }, true);
+            }
+
+            float facing = aim.yaw + aim.turret;
+            if (Mathf.Abs(Mathf.DeltaAngle(facing, world)) > 8f)
+                throw new InvalidOperationException("Башня уехала вместе с корпусом: " + facing);
+
+            var rear = CarSim.Spawn(0);
+            for (int i = 0; i < 40; i++)
+                rear = CarSim.Apply(rear, new DriveInput { tick = i + 1, turret = 180 }, true);
+            if (Mathf.Abs(Mathf.DeltaAngle(rear.yaw + rear.turret, 180f)) > 2f)
+                throw new InvalidOperationException("Башня не развернулась назад: " + rear.turret);
+
+            var flatDrop = CarSim.Fly(shooter, System.Array.Empty<CarState>(), 0, null, 0, out _);
+            var down = shooter;
+            down.pitch = -30f;
+            var downDrop = CarSim.Fly(down, System.Array.Empty<CarState>(), 0, null, 0, out _);
+            if (!flatDrop.surface || !downDrop.surface || downDrop.point.y > 0.05f || downDrop.point.z > flatDrop.point.z)
+                throw new InvalidOperationException("Наклон вниз не сократил падение на землю.");
+
+            var lob = shooter;
+            lob.pitch = 45f;
+            var arc = new Vector3[96];
+            CarSim.Muzzle(lob, out Vector3 muzzle, out _);
+            CarSim.Fly(lob, System.Array.Empty<CarState>(), 0, arc, arc.Length, out int arcCount);
+            float peak = muzzle.y;
+            for (int i = 0; i < arcCount; i++)
+            {
+                if (arc[i].y > peak)
+                    peak = arc[i].y;
+            }
+
+            if (peak < muzzle.y + 0.8f)
+                throw new InvalidOperationException("Подъём ствола не поднял траекторию. peak=" + peak);
+
+            var spot = new Vector3(shooter.x + 1.5f, 0f, shooter.z + 8f);
+            CarSim.SolveAim(shooter, spot, out int spotYaw, out int spotPitch);
+            var aimedSpot = shooter;
+            aimedSpot.pitch = spotPitch;
+            aimedSpot.turret = Mathf.DeltaAngle(aimedSpot.yaw, spotYaw);
+            var landing = CarSim.Fly(aimedSpot, System.Array.Empty<CarState>(), 0, null, 0, out _);
+            float miss = Vector2.Distance(new Vector2(landing.point.x, landing.point.z), new Vector2(spot.x, spot.z));
+            if (!landing.surface || miss > 1.5f)
+                throw new InvalidOperationException("Дуга не пришла в точку на земле: " + miss);
+
+            var snapped = CarSim.Apply(CarSim.Spawn(0), new DriveInput
+            {
+                tick = 1,
+                turret = 80,
+                pitch = -15,
+                snapAim = true
+            }, true);
+            if (Mathf.Abs(Mathf.DeltaAngle(snapped.yaw + snapped.turret, 80f)) > 1f || Mathf.Abs(snapped.pitch + 15f) > 0.1f)
+                throw new InvalidOperationException("Прицел не повернул пушку сразу: " + snapped.turret + " / " + snapped.pitch);
+
+            var traffic = ReplicationBudget.Measure();
+            if (traffic.props < 50)
+                throw new InvalidOperationException("На арене меньше 50 реплицируемых объектов: " + traffic.props);
+            if (traffic.optimizedBytes >= traffic.baselineBytes || traffic.reductionPercent < 40f)
+                throw new InvalidOperationException(
+                    "Оптимизация репликации не снизила трафик на 40%: "
+                    + traffic.baselineBytes + " → " + traffic.optimizedBytes);
+            if (traffic.baselineBytes != 147900 || traffic.optimizedBytes != 3950)
+                throw new InvalidOperationException(
+                    "Профиль репликации разъехался с отчётом: "
+                    + traffic.baselineBytes + " / " + traffic.optimizedBytes);
 
             Debug.Log("CAR_COMBAT_CHECKS_OK");
         }

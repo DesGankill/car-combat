@@ -14,6 +14,10 @@ namespace CarCombat
         void Awake()
         {
             Application.runInBackground = true;
+            if (GetComponent<AimScope>() == null)
+                gameObject.AddComponent<AimScope>();
+            if (GetComponent<ReplicationWorld>() == null)
+                gameObject.AddComponent<ReplicationWorld>();
         }
 
         void Start()
@@ -29,13 +33,25 @@ namespace CarCombat
             };
         }
 
+        public static Rect Panel => AimScope.Open
+            ? new Rect(324f, 12f, 388f, 540f)
+            : new Rect(12f, 12f, 388f, 540f);
+
+        public static bool ContainsPointer()
+        {
+            var pointer = Input.mousePosition;
+            pointer.y = Screen.height - pointer.y;
+            return Panel.Contains(pointer);
+        }
+
         void OnGUI()
         {
             var previous = GUI.skin.label.fontSize;
             GUI.skin.label.fontSize = 15;
             GUI.skin.button.fontSize = 15;
             GUI.skin.textField.fontSize = 15;
-            GUILayout.BeginArea(new Rect(12f, 12f, 388f, 540f), GUI.skin.box);
+            var panel = Panel;
+            GUILayout.BeginArea(new Rect(panel.x, panel.y, panel.width, panel.height), GUI.skin.box);
             GUILayout.Label("Car Combat");
 
             var manager = NetworkManager.Singleton;
@@ -114,17 +130,30 @@ namespace CarCombat
             GUILayout.Label(
                 "Скорость " + state.speed.ToString("0.0")
                 + "   блоки " + CarSim.Count(state.blocks) + "/" + CarSim.BlueprintCount
-                + "   башня " + state.turret.ToString("0") + "°");
+                + "   башня " + state.turret.ToString("0") + "°"
+                + "   наклон " + state.pitch.ToString("0") + "°");
             var parts = CarSim.Evaluate(state.blocks);
             GUILayout.Label(
                 "Ход " + (parts.drive * 100f).ToString("0") + "%"
                 + "   мощность " + parts.power.ToString("0")
                 + "   масса " + parts.mass.ToString("0.0"));
             GUILayout.Label("Неподтверждённых команд: " + local.PendingCount);
+            var traffic = ReplicationBudget.Measure();
+            GUILayout.Label(
+                "Репликация 5 с, 1 клиент: "
+                + traffic.baselineKbPerSec.ToString("0.00")
+                + " → "
+                + traffic.optimizedKbPerSec.ToString("0.00")
+                + " КБ/с (−"
+                + traffic.reductionPercent.ToString("0")
+                + "%)");
             if (!string.IsNullOrEmpty(local.Notice))
                 GUILayout.Label(local.Notice);
 
-            GUILayout.Label("WASD — газ и руль. Q/E — башня. Пробел или ЛКМ — выстрел.");
+            var shell = Solid.Of(local.SelectedShell);
+            GUILayout.Label("Снаряд " + (local.SelectedShell + 1) + ": " + shell.title + "   (клавиши 1, 2…)");
+            GUILayout.Label("WASD — газ и руль. Мышь — земля под курсором или воксель чужой машины.");
+            GUILayout.Label("ПКМ — прицел: мышь крутит пушку как в шутере, своя машина в окне скрыта.");
             GUILayout.Label("F2 — локально увести машину. F3 — выстрел сквозь кулдаун.");
             if (GUILayout.Button(local.PredictionEnabled ? "Выключить предсказание" : "Включить предсказание"))
                 local.SetPrediction(!local.PredictionEnabled);

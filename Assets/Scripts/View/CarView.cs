@@ -24,6 +24,7 @@ namespace CarCombat
         }
 
         Transform turretPivot;
+        Transform gunPivot;
         Cube[] cubes = Array.Empty<Cube>();
         VoxelMask shownMask;
         bool maskReady;
@@ -44,9 +45,46 @@ namespace CarCombat
             ApplyMask(avatar.RenderState.blocks);
             if (turretPivot != null)
                 turretPivot.localRotation = Quaternion.Euler(0f, avatar.RenderState.turret, 0f);
+            if (gunPivot != null)
+                gunPivot.localRotation = Quaternion.Euler(-avatar.RenderState.pitch, 0f, 0f);
+            if (avatar.IsOwner && GetComponent<ShotPreview>() == null)
+                gameObject.AddComponent<ShotPreview>();
             if (!avatar.IsOwner && avatar.RenderState.lastShotTick != seenShot && seenShot != int.MinValue)
                 ShowTracer(avatar.RenderState);
             seenShot = avatar.RenderState.lastShotTick;
+        }
+
+        public const int ScopeHiddenLayer = 30;
+
+        public void SetHiddenFromScope(bool hidden)
+        {
+            int layer = hidden ? ScopeHiddenLayer : 0;
+            for (int i = 0; i < cubes.Length; i++)
+            {
+                if (cubes[i].transform != null)
+                    cubes[i].transform.gameObject.layer = layer;
+            }
+        }
+
+        public bool RaycastSolid(Ray ray, out Vector3 point, out float distance)
+        {
+            point = default;
+            distance = float.PositiveInfinity;
+            var direction = ray.direction.sqrMagnitude > 0.0001f ? ray.direction.normalized : Vector3.forward;
+            bool found = false;
+            for (int i = 0; i < cubes.Length; i++)
+            {
+                var cube = cubes[i];
+                if (cube.renderer == null || !cube.transform.gameObject.activeInHierarchy)
+                    continue;
+                if (!cube.renderer.bounds.IntersectRay(new Ray(ray.origin, direction), out float hit) || hit < 0f || hit >= distance)
+                    continue;
+                distance = hit;
+                point = ray.origin + direction * hit;
+                found = true;
+            }
+
+            return found;
         }
 
         public void Paint(ulong clientId)
@@ -79,19 +117,23 @@ namespace CarCombat
 
         public void ShowTracer(CarState state)
         {
-            CarSim.Muzzle(state, out Vector3 origin, out Vector3 forward);
-            var tracer = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            Destroy(tracer.GetComponent<Collider>());
-            const float length = 11f;
-            tracer.transform.position = origin + forward * (length * 0.5f);
-            tracer.transform.rotation = Quaternion.LookRotation(forward);
-            tracer.transform.localScale = new Vector3(0.06f, 0.06f, length);
-            var renderer = tracer.GetComponent<Renderer>();
-            renderer.sharedMaterial = SharedMaterial();
-            var property = new MaterialPropertyBlock();
-            property.SetColor("_Color", new Color(1f, 0.85f, 0.35f));
-            renderer.SetPropertyBlock(property);
-            Destroy(tracer, 0.12f);
+            var targets = new CarState[4];
+            int countCars = 0;
+            var cars = FindObjectsByType<CarAvatar>();
+            for (int i = 0; i < cars.Length && countCars < targets.Length; i++)
+            {
+                if (cars[i] == avatar || !cars[i].HasState)
+                    continue;
+                targets[countCars++] = cars[i].RenderState;
+            }
+
+            var samples = new Vector3[160];
+            CarSim.Fly(state, targets, countCars, samples, samples.Length, out int count);
+            if (count <= 0)
+                return;
+            var voxel = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            voxel.name = "Shell";
+            voxel.AddComponent<ShellVoxel>().Launch(samples, count, Solid.Of(state.lastShell), CarSim.BulletStep);
         }
 
         void BuildBlocks()
@@ -99,6 +141,8 @@ namespace CarCombat
             turretPivot = new GameObject("Turret").transform;
             turretPivot.SetParent(transform, false);
             turretPivot.localPosition = CarSim.TurretPivot;
+            gunPivot = new GameObject("Gun").transform;
+            gunPivot.SetParent(turretPivot, false);
             var material = SharedMaterial();
             float scale = CarSim.Cell * 0.998f;
             int filled = CarSim.BlueprintCount;
@@ -115,7 +159,7 @@ namespace CarCombat
                 cube.name = "Block_" + ix + "_" + iy + "_" + iz;
                 VoxelRole role = CarSim.RoleOf(i);
                 bool mounted = role == VoxelRole.Gun || role == VoxelRole.Turret;
-                var parent = mounted ? turretPivot : transform;
+                var parent = role == VoxelRole.Gun ? gunPivot : mounted ? turretPivot : transform;
                 cube.transform.SetParent(parent, false);
                 var center = new Vector3(x, y, z);
                 cube.transform.localPosition = mounted ? center - CarSim.TurretPivot : center;

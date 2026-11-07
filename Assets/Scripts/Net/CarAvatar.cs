@@ -22,6 +22,7 @@ namespace CarCombat
         public bool PredictionEnabled { get; private set; } = true;
         public int PendingCount => pending.Count;
         public string Notice { get; private set; } = "";
+        public int SelectedShell { get; private set; }
 
         readonly List<DriveInput> pending = new List<DriveInput>(64);
         readonly List<Outgoing> outbox = new List<Outgoing>(32);
@@ -33,7 +34,12 @@ namespace CarCombat
         bool placed;
         int nextTick = 1;
         int pendingReliableFire = -1;
+        int pendingShell;
         bool fireLatch;
+        bool aimReady;
+        bool scoped;
+        int aimYaw;
+        int aimPitch;
         float noticeUntil;
         CarView view;
 
@@ -78,8 +84,38 @@ namespace CarCombat
                 fireLatch = true;
             }
 
-            if ((Input.GetKeyDown(KeyCode.Space) || Input.GetMouseButtonDown(0)) && !PointerOverHud())
+            for (int i = 0; i < Solid.Count && i < 9; i++)
+            {
+                if (Input.GetKeyDown(KeyCode.Alpha1 + i) || Input.GetKeyDown(KeyCode.Keypad1 + i))
+                    SelectedShell = i;
+            }
+
+            if ((Input.GetKeyDown(KeyCode.Space) || Input.GetMouseButtonDown(0)) && !MatchHud.ContainsPointer())
                 fireLatch = true;
+
+            if (HasState)
+            {
+                bool scope = AimScope.Open;
+                if (scope && !scoped)
+                {
+                    float world = Mathf.Repeat(RenderState.yaw + RenderState.turret + 180f, 360f) - 180f;
+                    aimYaw = Mathf.RoundToInt(world);
+                    aimPitch = Mathf.RoundToInt(Mathf.Clamp(RenderState.pitch, CarSim.PitchMin, CarSim.PitchMax));
+                }
+
+                if (scope)
+                    ReadScopeAim();
+                else
+                    aimYaw = ReadWorldAim(RenderState);
+                if (!scope && scoped)
+                {
+                    Cursor.lockState = CursorLockMode.None;
+                    Cursor.visible = true;
+                }
+
+                scoped = scope;
+                aimReady = true;
+            }
 
             FlushOutbox();
             FlushSnapshot();
@@ -97,7 +133,10 @@ namespace CarCombat
                 tick = nextTick++,
                 throttle = ReadAxis(KeyCode.W, KeyCode.UpArrow, KeyCode.S, KeyCode.DownArrow),
                 steer = ReadAxis(KeyCode.D, KeyCode.RightArrow, KeyCode.A, KeyCode.LeftArrow),
-                turret = (Input.GetKey(KeyCode.E) ? 1 : 0) - (Input.GetKey(KeyCode.Q) ? 1 : 0),
+                turret = aimReady ? aimYaw : Mathf.RoundToInt(predicted.yaw + predicted.turret),
+                pitch = aimReady ? aimPitch : Mathf.RoundToInt(predicted.pitch),
+                shell = SelectedShell,
+                snapAim = AimScope.Open,
                 fire = fireLatch
             };
             fireLatch = false;
@@ -196,7 +235,7 @@ namespace CarCombat
             if (lag <= 0f)
             {
                 if (reliableFire)
-                    SubmitFireRpc(input.tick);
+                    SubmitFireRpc(input.tick, input.shell);
                 else
                     SubmitDriveRpc(input);
                 return;
@@ -223,7 +262,7 @@ namespace CarCombat
                 var item = outbox[i];
                 outbox.RemoveAt(i);
                 if (item.reliableFire)
-                    SubmitFireRpc(item.input.tick);
+                    SubmitFireRpc(item.input.tick, item.input.shell);
                 else
                     SubmitDriveRpc(item.input);
             }
@@ -244,7 +283,7 @@ namespace CarCombat
         }
 
         [Rpc(SendTo.Server, Delivery = RpcDelivery.Reliable, InvokePermission = RpcInvokePermission.Owner)]
-        void SubmitFireRpc(int tick)
+        void SubmitFireRpc(int tick, int shell)
         {
             var state = ServerState.Value;
             if (tick <= state.tick)
@@ -253,12 +292,14 @@ namespace CarCombat
                     return;
                 state.cooldown = CarSim.ShotCooldown;
                 state.lastShotTick = tick;
+                state.lastShell = shell;
                 ServerState.Value = state;
-                ResolveShot(state);
+                ResolveShot(state, shell);
                 return;
             }
 
             pendingReliableFire = tick;
+            pendingShell = shell;
         }
 
         void ApplyServerInput(DriveInput input)
@@ -273,6 +314,7 @@ namespace CarCombat
             if (pendingReliableFire > 0 && input.tick >= pendingReliableFire)
             {
                 input.fire = true;
+                input.shell = pendingShell;
                 pendingReliableFire = -1;
             }
 
@@ -280,24 +322,38 @@ namespace CarCombat
             var next = CarSim.Apply(state, input, true);
             next = AvoidOthers(next);
             if (input.fire && next.lastShotTick != shotBefore)
-                ResolveShot(next);
+                ResolveShot(next, input.shell);
             ServerState.Value = next;
         }
 
-        void ResolveShot(CarState shooter)
+        void ResolveShot(CarState shooter, int shellIndex)
         {
             var cars = FindObjectsByType<CarAvatar>();
-            for (int i = 0; i < cars.Length; i++)
+            var states = new CarState[4];
+            var avatars = new CarAvatar[4];
+            int count = 0;
+            for (int i = 0; i < cars.Length && count < states.Length; i++)
             {
-                var other = cars[i];
-                if (other == this || !other.IsSpawned)
+                if (cars[i] == this || !cars[i].IsSpawned)
                     continue;
-                var target = other.ServerState.Value;
-                if (!CarSim.TryHit(shooter, target, out int block))
+                avatars[count] = cars[i];
+                states[count] = cars[i].ServerState.Value;
+                count++;
+            }
+
+            var hit = CarSim.Fly(shooter, states, count, null, 0, out _);
+            var shell = Solid.Of(shellIndex);
+            for (int i = 0; i < count; i++)
+            {
+                int direct = hit.car && hit.target == i ? hit.block : -1;
+                if (direct < 0 && shell.splashRadius <= 0f)
                     continue;
-                target.blocks = CarSim.Damage(target.blocks, block);
-                other.ServerState.Value = target;
-                break;
+                var target = states[i];
+                var damaged = CarSim.ApplyShell(target.blocks, target, hit.point, shellIndex, direct);
+                if (damaged.Equals(target.blocks))
+                    continue;
+                target.blocks = damaged;
+                avatars[i].ServerState.Value = target;
             }
         }
 
@@ -354,6 +410,7 @@ namespace CarCombat
 
             replay.blocks = next.blocks;
             replay.lastShotTick = next.lastShotTick;
+            replay.lastShell = next.lastShell;
             predicted = replay;
             RenderState = replay;
             HasState = true;
@@ -419,11 +476,51 @@ namespace CarCombat
             return value;
         }
 
-        static bool PointerOverHud()
+        void ReadScopeAim()
         {
-            var pointer = Input.mousePosition;
-            pointer.y = Screen.height - pointer.y;
-            return pointer.x >= 12f && pointer.x <= 400f && pointer.y >= 12f && pointer.y <= 560f;
+            const float look = 3.2f;
+            float yaw = aimYaw + Input.GetAxis("Mouse X") * look;
+            float pitch = aimPitch + Input.GetAxis("Mouse Y") * look;
+            aimYaw = Mathf.RoundToInt(Mathf.Repeat(yaw + 180f, 360f) - 180f);
+            aimPitch = Mathf.RoundToInt(Mathf.Clamp(pitch, CarSim.PitchMin, CarSim.PitchMax));
+            Cursor.lockState = CursorLockMode.Locked;
+            Cursor.visible = false;
+        }
+
+        int ReadWorldAim(CarState state)
+        {
+            var camera = Camera.main;
+            if (camera == null)
+                return aimYaw;
+            var ray = camera.ScreenPointToRay(Input.mousePosition);
+            float best = float.PositiveInfinity;
+            var aimPoint = Vector3.zero;
+            bool found = false;
+            var cars = FindObjectsByType<CarAvatar>();
+            for (int i = 0; i < cars.Length; i++)
+            {
+                if (cars[i] == this)
+                    continue;
+                var view = cars[i].GetComponent<CarView>();
+                if (view == null || !view.RaycastSolid(ray, out Vector3 voxel, out float voxelDistance) || voxelDistance >= best)
+                    continue;
+                best = voxelDistance;
+                aimPoint = voxel;
+                found = true;
+            }
+
+            var ground = new Plane(Vector3.up, Vector3.zero);
+            if (ground.Raycast(ray, out float groundDistance) && groundDistance > 0f && groundDistance < best)
+            {
+                aimPoint = ray.GetPoint(groundDistance);
+                found = true;
+            }
+
+            if (!found)
+                return aimYaw;
+
+            CarSim.SolveAim(state, aimPoint, out aimYaw, out aimPitch);
+            return aimYaw;
         }
     }
 }

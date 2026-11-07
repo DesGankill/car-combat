@@ -6,6 +6,7 @@ namespace CarCombat
 {
     /// <summary>
     /// Команда игрока. Позиции здесь нет: сервер не должен принимать координаты клиента.
+    /// turret — мировой курс ствола в градусах. pitch — наклон ствола, выше или ниже горизонта.
     /// </summary>
     [Serializable]
     public struct DriveInput : INetworkSerializable, IEquatable<DriveInput>
@@ -14,6 +15,9 @@ namespace CarCombat
         public int throttle;
         public int steer;
         public int turret;
+        public int pitch;
+        public int shell;
+        public bool snapAim;
         public bool fire;
 
         public void NetworkSerialize<T>(BufferSerializer<T> serializer) where T : IReaderWriter
@@ -22,12 +26,15 @@ namespace CarCombat
             serializer.SerializeValue(ref throttle);
             serializer.SerializeValue(ref steer);
             serializer.SerializeValue(ref turret);
+            serializer.SerializeValue(ref pitch);
+            serializer.SerializeValue(ref shell);
+            serializer.SerializeValue(ref snapAim);
             serializer.SerializeValue(ref fire);
         }
 
         public bool Equals(DriveInput other)
         {
-            return tick == other.tick && throttle == other.throttle && steer == other.steer && turret == other.turret && fire == other.fire;
+            return tick == other.tick && throttle == other.throttle && steer == other.steer && turret == other.turret && pitch == other.pitch && shell == other.shell && snapAim == other.snapAim && fire == other.fire;
         }
     }
 
@@ -42,10 +49,12 @@ namespace CarCombat
         public float z;
         public float yaw;
         public float turret;
+        public float pitch;
         public float speed;
         public float cooldown;
         public VoxelMask blocks;
         public int lastShotTick;
+        public int lastShell;
 
         public void NetworkSerialize<T>(BufferSerializer<T> serializer) where T : IReaderWriter
         {
@@ -54,10 +63,12 @@ namespace CarCombat
             serializer.SerializeValue(ref z);
             serializer.SerializeValue(ref yaw);
             serializer.SerializeValue(ref turret);
+            serializer.SerializeValue(ref pitch);
             serializer.SerializeValue(ref speed);
             serializer.SerializeValue(ref cooldown);
             serializer.SerializeValue(ref blocks);
             serializer.SerializeValue(ref lastShotTick);
+            serializer.SerializeValue(ref lastShell);
         }
 
         public bool Equals(CarState other)
@@ -67,10 +78,12 @@ namespace CarCombat
                 && z.Equals(other.z)
                 && yaw.Equals(other.yaw)
                 && turret.Equals(other.turret)
+                && pitch.Equals(other.pitch)
                 && speed.Equals(other.speed)
                 && cooldown.Equals(other.cooldown)
                 && blocks.Equals(other.blocks)
-                && lastShotTick == other.lastShotTick;
+                && lastShotTick == other.lastShotTick
+                && lastShell == other.lastShell;
         }
 
         public override bool Equals(object obj)
@@ -96,6 +109,13 @@ namespace CarCombat
         public const float Drag = 8f;
         public const float MaxSpeed = 13f;
         public const float TurnRate = 160f;
+        public const float TurretRate = 420f;
+        public const float PitchRate = 280f;
+        public const float PitchMin = -40f;
+        public const float PitchMax = 55f;
+        public const float MuzzleSpeed = 42f;
+        public const float Gravity = 20f;
+        public const float BulletStep = 0.02f;
         public const float ShotCooldown = 0.35f;
         public const float Cell = 0.32f;
         public const float MuzzleHeight = Cell * 1.5f;
@@ -464,6 +484,7 @@ namespace CarCombat
             {
                 state.cooldown = ShotCooldown;
                 state.lastShotTick = input.tick;
+                state.lastShell = input.shell;
             }
 
             return state;
@@ -490,6 +511,7 @@ namespace CarCombat
             float maxSpeed = MaxSpeed * Mathf.Sqrt(Mathf.Max(scale, 0f));
             state.speed = Mathf.Clamp(state.speed, -maxSpeed * 0.4f, maxSpeed);
 
+            float yawBefore = state.yaw;
             float turn = steer * TurnRate * TickDt * Mathf.Clamp01(Mathf.Abs(state.speed) / 3.5f);
             if (state.speed < 0f)
                 turn = -turn;
@@ -525,8 +547,22 @@ namespace CarCombat
             if (hitWall)
                 state.speed = 0f;
 
-            if (stats.canAim && input.turret != 0)
-                state.turret = Mathf.Clamp(state.turret + input.turret * 100f * TickDt, -110f, 110f);
+            if (stats.canAim)
+            {
+                float desired = Mathf.DeltaAngle(state.yaw, input.turret);
+                if (input.snapAim)
+                {
+                    state.turret = Mathf.Repeat(desired + 180f, 360f) - 180f;
+                    state.pitch = Mathf.Clamp(input.pitch, PitchMin, PitchMax);
+                }
+                else
+                {
+                    state.turret -= Mathf.DeltaAngle(yawBefore, state.yaw);
+                    float step = Mathf.Clamp(Mathf.DeltaAngle(state.turret, desired), -TurretRate * TickDt, TurretRate * TickDt);
+                    state.turret = Mathf.Repeat(state.turret + step + 180f, 360f) - 180f;
+                    state.pitch = Mathf.MoveTowards(state.pitch, Mathf.Clamp(input.pitch, PitchMin, PitchMax), PitchRate * TickDt);
+                }
+            }
 
             state.cooldown = Mathf.Max(0f, state.cooldown - TickDt);
             state.tick = input.tick;
@@ -535,92 +571,327 @@ namespace CarCombat
 
         public static bool TryHit(CarState shooter, CarState target, out int block)
         {
-            block = -1;
-            if (target.blocks.IsEmpty || !Evaluate(shooter.blocks).canFire)
-                return false;
+            return TryHit(shooter, target, out block, out _);
+        }
+
+        static readonly CarState[] oneTarget = new CarState[1];
+
+        public static bool TryHit(CarState shooter, CarState target, out int block, out float distance)
+        {
+            oneTarget[0] = target;
+            var hit = Fly(shooter, oneTarget, 1, null, 0, out _);
+            block = hit.block;
+            distance = hit.distance;
+            return hit.car;
+        }
+
+        public static BallisticHit Fly(
+            CarState shooter,
+            CarState[] targets,
+            int targetCount,
+            Vector3[] samples,
+            int capacity,
+            out int written)
+        {
+            written = 0;
+            var miss = new BallisticHit { block = -1, distance = ShotRange, point = new Vector3(shooter.x, 0f, shooter.z) };
+            if (!Evaluate(shooter.blocks).canFire)
+                return miss;
 
             Muzzle(shooter, out Vector3 origin, out Vector3 direction);
-            float dx = origin.x - target.x;
-            float dz = origin.z - target.z;
-            WorldToLocal(dx, dz, target.yaw, out float originX, out float originZ);
-            WorldToLocal(direction.x, direction.z, target.yaw, out float dirX, out float dirZ);
-
-            float best = ShotRange;
-            for (int i = 0; i < BlockCount; i++)
+            var pos = origin + direction * (Cell * 0.65f);
+            var velocity = direction * MuzzleSpeed;
+            float traveled = Cell * 0.65f;
+            int guard = 0;
+            while (traveled < ShotRange && guard < 160)
             {
-                if (target.blocks.Get(i) <= 0)
-                    continue;
-                CellOf(i, out int ix, out int iy, out int iz);
-                float minX = ix * Cell - HalfW;
-                float minY = iy * Cell;
-                float minZ = iz * Cell - HalfL;
-                float enter = 0f;
-                float exit = ShotRange;
-                if (!Slab(originX, dirX, minX, minX + Cell, ref enter, ref exit))
-                    continue;
-                if (!Slab(origin.y, 0f, minY, minY + Cell, ref enter, ref exit))
-                    continue;
-                if (!Slab(originZ, dirZ, minZ, minZ + Cell, ref enter, ref exit))
-                    continue;
-                if (enter < best)
+                guard++;
+                var previous = pos;
+                velocity.y -= Gravity * BulletStep;
+                pos += velocity * BulletStep;
+                float step = Vector3.Distance(previous, pos);
+                if (step < 0.00001f)
+                    break;
+
+                float carT = 2f;
+                int carBlock = -1;
+                int carIndex = -1;
+                int count = targets == null ? 0 : targetCount;
+                for (int c = 0; c < count; c++)
                 {
-                    best = enter;
-                    block = i;
+                    if (!SegmentCar(previous, pos, targets[c], out int block, out float t))
+                        continue;
+                    if (t >= carT)
+                        continue;
+                    carT = t;
+                    carBlock = block;
+                    carIndex = c;
                 }
+
+                float groundT = CrossDown(previous.y, pos.y, 0f);
+                float wallT = CrossWall(previous, pos);
+                float surfaceT = groundT < wallT ? groundT : wallT;
+                bool hitCar = carT <= 1f && carT <= surfaceT;
+                bool hitSurface = !hitCar && surfaceT <= 1f;
+                if (hitCar || hitSurface)
+                {
+                    float t = hitCar ? carT : surfaceT;
+                    var point = Vector3.Lerp(previous, pos, Mathf.Clamp01(t));
+                    if (!hitCar && groundT <= wallT)
+                        point.y = 0f;
+                    WriteSample(samples, capacity, ref written, point);
+                    return new BallisticHit
+                    {
+                        car = hitCar,
+                        surface = hitSurface,
+                        block = hitCar ? carBlock : -1,
+                        point = point,
+                        distance = traveled + step * Mathf.Clamp01(t),
+                        target = carIndex
+                    };
+                }
+
+                traveled += step;
+                WriteSample(samples, capacity, ref written, pos);
             }
 
-            return block >= 0;
+            miss.point = pos;
+            miss.distance = traveled;
+            return miss;
+        }
+
+        public static Vector3 TurretWorld(CarState state)
+        {
+            float yaw = state.yaw * Mathf.Deg2Rad;
+            float sin = Mathf.Sin(yaw);
+            float cos = Mathf.Cos(yaw);
+            return new Vector3(
+                state.x + TurretPivot.x * cos + TurretPivot.z * sin,
+                TurretPivot.y,
+                state.z - TurretPivot.x * sin + TurretPivot.z * cos);
+        }
+
+        public static void SolveAim(CarState state, Vector3 point, out int worldYaw, out int pitch)
+        {
+            float yaw = Mathf.Atan2(point.x - state.x, point.z - state.z) * Mathf.Rad2Deg;
+            var probe = state;
+            probe.turret = Mathf.DeltaAngle(state.yaw, yaw);
+            probe.pitch = 0f;
+            for (int i = 0; i < 2; i++)
+            {
+                Muzzle(probe, out Vector3 origin, out _);
+                yaw = Mathf.Atan2(point.x - origin.x, point.z - origin.z) * Mathf.Rad2Deg;
+                probe.turret = Mathf.DeltaAngle(probe.yaw, yaw);
+                probe.pitch = Mathf.Clamp(BallisticPitch(origin, point), PitchMin, PitchMax);
+            }
+
+            worldYaw = Mathf.RoundToInt(Mathf.Repeat(yaw + 180f, 360f) - 180f);
+            pitch = Mathf.RoundToInt(probe.pitch);
+        }
+
+        static float BallisticPitch(Vector3 origin, Vector3 point)
+        {
+            float dx = point.x - origin.x;
+            float dz = point.z - origin.z;
+            float distance = Mathf.Sqrt(dx * dx + dz * dz);
+            float height = point.y - origin.y;
+            if (distance < 0.2f)
+                return height >= 0f ? PitchMax : PitchMin;
+
+            float speed2 = MuzzleSpeed * MuzzleSpeed;
+            float disc = speed2 * speed2 - Gravity * (Gravity * distance * distance + 2f * height * speed2);
+            if (disc < 0f)
+                return 45f;
+            float tangent = (speed2 - Mathf.Sqrt(disc)) / (Gravity * distance);
+            return Mathf.Atan(tangent) * Mathf.Rad2Deg;
+        }
+
+        public static int WorldYawDegrees(Vector3 pivot, Vector3 point, int fallback)
+        {
+            float dx = point.x - pivot.x;
+            float dz = point.z - pivot.z;
+            if (dx * dx + dz * dz < 0.0004f)
+                return fallback;
+            float yaw = Mathf.Atan2(dx, dz) * Mathf.Rad2Deg;
+            return Mathf.RoundToInt(Mathf.Repeat(yaw + 180f, 360f) - 180f);
+        }
+
+        public static Vector3 BlockWorld(CarState car, int block)
+        {
+            CellCenter(block, out float x, out float y, out float z);
+            float yaw = car.yaw * Mathf.Deg2Rad;
+            float sin = Mathf.Sin(yaw);
+            float cos = Mathf.Cos(yaw);
+            return new Vector3(
+                car.x + x * cos + z * sin,
+                y,
+                car.z - x * sin + z * cos);
         }
 
         public static void Muzzle(CarState shooter, out Vector3 origin, out Vector3 direction)
         {
-            float aim = (shooter.yaw + shooter.turret) * Mathf.Deg2Rad;
-            direction = new Vector3(Mathf.Sin(aim), 0f, Mathf.Cos(aim));
-            int barrel = -1;
+            var spin = Quaternion.Euler(0f, shooter.turret, 0f) * Quaternion.Euler(-shooter.pitch, 0f, 0f);
+            var hull = Quaternion.Euler(0f, shooter.yaw, 0f);
+            direction = hull * spin * Vector3.forward;
             float bestZ = float.MinValue;
+            var carLocal = new Vector3(0f, MuzzleHeight, HalfL * 0.4f);
             for (int i = 0; i < BlockCount; i++)
             {
                 if (Roles[i] != VoxelRole.Gun || shooter.blocks.Get(i) <= 0)
                     continue;
-                CellCenter(i, out _, out _, out float localZ);
-                if (localZ < bestZ)
+                CellCenter(i, out float cellX, out float cellY, out float cellZ);
+                if (cellZ < bestZ)
                     continue;
-                bestZ = localZ;
-                barrel = i;
+                bestZ = cellZ;
+                carLocal = new Vector3(cellX, cellY, cellZ);
             }
 
-            float localX = 0f;
-            float localY = MuzzleHeight;
-            float spunZ = HalfL * 0.4f;
-            if (barrel >= 0)
+            origin = hull * (spin * (carLocal - TurretPivot) + TurretPivot) + new Vector3(shooter.x, 0f, shooter.z);
+        }
+
+        static void WriteSample(Vector3[] samples, int capacity, ref int written, Vector3 point)
+        {
+            if (samples == null || written >= capacity || written >= samples.Length)
+                return;
+            samples[written++] = point;
+        }
+
+        static bool SegmentCar(Vector3 a, Vector3 b, CarState car, out int block, out float tHit)
+        {
+            block = -1;
+            tHit = 2f;
+            if (car.blocks.IsEmpty)
+                return false;
+
+            var localA = ToLocal(a, car);
+            var localB = ToLocal(b, car);
+            float minX = Mathf.Min(localA.x, localB.x);
+            float maxX = Mathf.Max(localA.x, localB.x);
+            float minY = Mathf.Min(localA.y, localB.y);
+            float maxY = Mathf.Max(localA.y, localB.y);
+            float minZ = Mathf.Min(localA.z, localB.z);
+            float maxZ = Mathf.Max(localA.z, localB.z);
+            if (maxX < -HalfW || minX > HalfW || maxZ < -HalfL || minZ > HalfL || maxY < 0f || minY > GridY * Cell)
+                return false;
+
+            int ix0 = Mathf.Clamp(Mathf.FloorToInt((minX + HalfW) / Cell) - 1, 0, GridX - 1);
+            int ix1 = Mathf.Clamp(Mathf.FloorToInt((maxX + HalfW) / Cell) + 1, 0, GridX - 1);
+            int iy0 = Mathf.Clamp(Mathf.FloorToInt(minY / Cell) - 1, 0, GridY - 1);
+            int iy1 = Mathf.Clamp(Mathf.FloorToInt(maxY / Cell) + 1, 0, GridY - 1);
+            int iz0 = Mathf.Clamp(Mathf.FloorToInt((minZ + HalfL) / Cell) - 1, 0, GridZ - 1);
+            int iz1 = Mathf.Clamp(Mathf.FloorToInt((maxZ + HalfL) / Cell) + 1, 0, GridZ - 1);
+            bool found = false;
+            for (int iz = iz0; iz <= iz1; iz++)
             {
-                CellCenter(barrel, out float cellX, out localY, out float cellZ);
-                float dx = cellX - TurretPivot.x;
-                float dz = cellZ - TurretPivot.z;
-                float turn = shooter.turret * Mathf.Deg2Rad;
-                float sine = Mathf.Sin(turn);
-                float cosine = Mathf.Cos(turn);
-                localX = TurretPivot.x + dx * cosine + dz * sine;
-                spunZ = TurretPivot.z - dx * sine + dz * cosine;
+                for (int iy = iy0; iy <= iy1; iy++)
+                {
+                    for (int ix = ix0; ix <= ix1; ix++)
+                    {
+                        int index = Index(ix, iy, iz);
+                        if (car.blocks.Get(index) <= 0)
+                            continue;
+                        var min = new Vector3(ix * Cell - HalfW, iy * Cell, iz * Cell - HalfL);
+                        var max = min + new Vector3(Cell, Cell, Cell);
+                        if (!SegmentAabb(localA, localB, min, max, out float t) || t >= tHit)
+                            continue;
+                        tHit = t;
+                        block = index;
+                        found = true;
+                    }
+                }
             }
 
-            float yaw = shooter.yaw * Mathf.Deg2Rad;
-            float sinYaw = Mathf.Sin(yaw);
-            float cosYaw = Mathf.Cos(yaw);
-            origin = new Vector3(
-                shooter.x + localX * cosYaw + spunZ * sinYaw,
-                localY,
-                shooter.z - localX * sinYaw + spunZ * cosYaw);
+            return found;
+        }
+
+        static Vector3 ToLocal(Vector3 world, CarState car)
+        {
+            WorldToLocal(world.x - car.x, world.z - car.z, car.yaw, out float x, out float z);
+            return new Vector3(x, world.y, z);
+        }
+
+        static bool SegmentAabb(Vector3 a, Vector3 b, Vector3 min, Vector3 max, out float tHit)
+        {
+            var dir = b - a;
+            float tMin = 0f;
+            float tMax = 1f;
+            tHit = 0f;
+            if (!Slab(a.x, dir.x, min.x, max.x, ref tMin, ref tMax))
+                return false;
+            if (!Slab(a.y, dir.y, min.y, max.y, ref tMin, ref tMax))
+                return false;
+            if (!Slab(a.z, dir.z, min.z, max.z, ref tMin, ref tMax))
+                return false;
+            if (tMax < 0f || tMin > 1f)
+                return false;
+            tHit = Mathf.Clamp01(tMin);
+            return true;
+        }
+
+        static float CrossDown(float fromY, float toY, float plane)
+        {
+            if (fromY <= plane)
+                return 0f;
+            if (toY > plane)
+                return 2f;
+            return (fromY - plane) / (fromY - toY);
+        }
+
+        static float CrossWall(Vector3 from, Vector3 to)
+        {
+            float best = 2f;
+            best = Mathf.Min(best, CrossPlane(from.x, to.x, ArenaBound));
+            best = Mathf.Min(best, CrossPlane(from.x, to.x, -ArenaBound));
+            best = Mathf.Min(best, CrossPlane(from.z, to.z, ArenaBound));
+            best = Mathf.Min(best, CrossPlane(from.z, to.z, -ArenaBound));
+            return best;
+        }
+
+        static float CrossPlane(float from, float to, float plane)
+        {
+            if ((from - plane) * (to - plane) > 0f)
+                return 2f;
+            if (Mathf.Abs(to - from) < 0.00001f)
+                return 2f;
+            float t = (plane - from) / (to - from);
+            return t >= 0f && t <= 1f ? t : 2f;
         }
 
         public static VoxelMask Damage(VoxelMask mask, int block)
         {
-            if (block < 0 || block >= BlockCount)
+            return Damage(mask, block, 1);
+        }
+
+        public static VoxelMask Damage(VoxelMask mask, int block, int amount)
+        {
+            if (block < 0 || block >= BlockCount || amount <= 0)
                 return mask;
             int hp = mask.Get(block);
             if (hp <= 0)
                 return mask;
-            return mask.Set(block, hp - 1);
+            return mask.Set(block, Mathf.Max(0, hp - amount));
+        }
+
+        public static VoxelMask ApplyShell(VoxelMask mask, CarState car, Vector3 impact, int shellIndex, int directBlock)
+        {
+            var shell = Solid.Of(shellIndex);
+            if (shell.splashRadius > 0f && shell.splashDamage > 0)
+            {
+                float reach = shell.splashRadius * shell.splashRadius;
+                for (int i = 0; i < BlockCount; i++)
+                {
+                    if (i == directBlock || mask.Get(i) <= 0)
+                        continue;
+                    var center = BlockWorld(car, i);
+                    if ((center - impact).sqrMagnitude > reach)
+                        continue;
+                    mask = Damage(mask, i, shell.splashDamage);
+                }
+            }
+
+            if (directBlock >= 0)
+                mask = Damage(mask, directBlock, shell.directDamage);
+            return mask;
         }
 
         public static CarState Collide(CarState self, CarState other)
@@ -767,6 +1038,16 @@ namespace CarCombat
         public bool canSteer;
         public bool canFire;
         public bool canAim;
+    }
+
+    public struct BallisticHit
+    {
+        public bool car;
+        public bool surface;
+        public int block;
+        public int target;
+        public Vector3 point;
+        public float distance;
     }
 
     /// <summary>
